@@ -40,7 +40,7 @@ def export(
             model,
             dummy_input, 
             onnx_path, 
-            opset_version=11    , 
+            opset_version=11, 
             input_names=["input"], 
             output_names=["output"], 
         )
