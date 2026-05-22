@@ -55,8 +55,8 @@ class DepthEngine:
         self.camera = Camera(sensor_id=sensor_id, frame_rate=frame_rate)
         self.width = input_size # width of the input tensor
         self.height = input_size # height of the input tensor
-        self._width = self.camera._width # width of the camera frame
-        self._height = self.camera._height # height of the camera frame
+        self._width = int(self.camera.cap[0].get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._height = int(self.camera.cap[0].get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.save_path = Path(save_path) if isinstance(save_path, str) else Path("results")
         self.raw = raw
         self.stream = stream
@@ -75,16 +75,27 @@ class DepthEngine:
         self.context = self.engine.create_execution_context()
         print(f"Engine loaded from {trt_engine_path}")
         
-        # Allocate pagelocked memory
-        self.h_input = cuda.pagelocked_empty(trt.volume((1, 3, self.width, self.height)), dtype=np.float32)
-        self.h_output = cuda.pagelocked_empty(trt.volume((1, 1, self.width, self.height)), dtype=np.float32)
-        
-        # Allocate device memory
-        self.d_input = cuda.mem_alloc(self.h_input.nbytes)
-        self.d_output = cuda.mem_alloc(self.h_output.nbytes)
-        
-        # Create a cuda stream
+        # Allocate buffers based on actual tensor shapes from the engine
         self.cuda_stream = cuda.Stream()
+        print(f"Number of IO tensors: {self.engine.num_io_tensors}")
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            shape = tuple(self.engine.get_tensor_shape(name))
+            dtype = self.engine.get_tensor_dtype(name)
+            mode = self.engine.get_tensor_mode(name)
+            volume = trt.volume(shape)
+            print(f"  Tensor[{i}]: name={name!r}, shape={shape}, dtype={dtype}, mode={mode}, volume={volume}")
+            h_buf = cuda.pagelocked_empty(volume, dtype=np.float32)
+            d_buf = cuda.mem_alloc(h_buf.nbytes)
+            if mode == trt.TensorIOMode.INPUT:
+                self.h_input, self.d_input = h_buf, d_buf
+            else:
+                self.h_output, self.d_output = h_buf, d_buf
+                self.output_shape = shape
+            self.context.set_tensor_address(name, int(d_buf))
+        print(f"Camera frame size: {self._width}x{self._height}")
+        print(f"Model input size: {self.width}x{self.height}")
+        print(f"Output tensor shape: {self.output_shape}")
         
         # Transform functions
         self.transform = Compose([
@@ -124,50 +135,53 @@ class DepthEngine:
         image /= 255.0
         image = self.transform({'image': image})['image']
         image = image[None]
-        
         return image
-    
+
     def postprocess(self, depth: np.ndarray) -> np.ndarray:
         """
         Postprocess the depth map
         """
-        depth = np.reshape(depth, (self.width, self.height))
+        raw = depth.copy()
+        print(f"  Raw output: min={raw.min():.4f}, max={raw.max():.4f}, mean={raw.mean():.4f}, nonzero={np.count_nonzero(raw)}/{raw.size}")
+        depth = depth.reshape(self.output_shape).squeeze()
+        print(f"  Reshaped depth: {depth.shape}")
         depth = cv2.resize(depth, (self._width, self._height))
-        
+
         if self.raw:
-            return depth # raw depth map
+            return depth
         else:
-            depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+            dmin, dmax = depth.min(), depth.max()
+            print(f"  Depth after resize: min={dmin:.4f}, max={dmax:.4f}")
+            if dmax - dmin < 1e-6:
+                print("  WARNING: depth map is nearly constant — output may be degenerate")
+            depth = (dmax - depth) / (dmax - dmin + 1e-6) * 255.0
             depth = depth.astype(np.uint8)
-            
+
             if self.grayscale:
                 depth = cv2.cvtColor(depth, cv2.COLOR_GRAY2BGR)
             else:
                 depth = cv2.applyColorMap(depth, cv2.COLORMAP_INFERNO)
-            
+
         return depth
-        
+
     def infer(self, image: np.ndarray) -> np.ndarray:
         """
         Infer depth from an image using TensorRT
         """
-        # Preprocess the image
         image = self.preprocess(image)
-        
+        print(f"  Preprocessed input: shape={image.shape}, min={image.min():.4f}, max={image.max():.4f}")
+
         t0 = time.time()
-        
-        # Copy the input image to the pagelocked memory
+
         np.copyto(self.h_input, image.ravel())
-        
-        # Copy the input to the GPU, execute the inference, and copy the output back to the CPU
         cuda.memcpy_htod_async(self.d_input, self.h_input, self.cuda_stream)
-        self.context.execute_async_v2(bindings=[int(self.d_input), int(self.d_output)], stream_handle=self.cuda_stream.handle)
+        self.context.execute_async_v3(stream_handle=self.cuda_stream.handle)
         cuda.memcpy_dtoh_async(self.h_output, self.d_output, self.cuda_stream)
         self.cuda_stream.synchronize()
-        
+
         print(f"Inference time: {time.time() - t0:.4f}s")
-        
-        return self.postprocess(self.h_output) # Postprocess the depth map
+
+        return self.postprocess(self.h_output)
     
     def run(self):
         """

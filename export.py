@@ -40,7 +40,7 @@ def export(
             model,
             dummy_input, 
             onnx_path, 
-            opset_version=11, 
+            opset_version=18,
             input_names=["input"], 
             output_names=["output"], 
         )
@@ -54,11 +54,10 @@ def export(
     network = builder.create_network(1 << (int)(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     parser = trt.OnnxParser(network, logger)
     
-    with open(onnx_path, "rb") as model:
-        if not parser.parse(model.read()):
-            for error in range(parser.num_errors):
-                print(parser.get_error(error))
-            raise ValueError('Failed to parse the ONNX model.')
+    if not parser.parse_from_file(str(onnx_path.resolve())):
+        for error in range(parser.num_errors):
+            print(parser.get_error(error))
+        raise ValueError('Failed to parse the ONNX model.')
     
     # Set up the builder config
     config = builder.create_builder_config()
