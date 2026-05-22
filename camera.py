@@ -67,8 +67,7 @@ class Camera:
             raise NotImplementedError("Multiple cameras are not supported yet")
     
         # To flip the image, modify the flip_method parameter (0 and 2 are the most common)
-        self.cap = [cv2.VideoCapture(self.gstreamer_pipeline(sensor_id=id, flip_method=0), \
-                    cv2.CAP_GSTREAMER) for id in self.sensor_id]
+        self.cap = [cv2.VideoCapture(0) for id in self.sensor_id]
         
         # Make record directory
         if save:
