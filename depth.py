@@ -2,9 +2,6 @@ from __future__ import annotations
 from typing import Sequence
 
 import argparse
-
-import logging
-
 import os
 import time
 import datetime
@@ -12,26 +9,20 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
-import tensorrt as trt
-import pycuda.autoinit # Don't remove this line
-import pycuda.driver as cuda
+import torch
 from torchvision.transforms import Compose
 
 from camera import Camera
-from depth_anything import transform
+from depth_anything import DepthAnything, transform
 
 
 class DepthEngine:
-    """
-    Real-time depth estimation using Depth Anything with TensorRT
-    """
     def __init__(
         self,
         sensor_id: int | Sequence[int] = 0,
         input_size: int = 308,
         frame_rate: int = 15,
-        trt_engine_path: str = 'weights/depth_anything_vits14_308.trt', # Must match with the input_size
+        weights_path: str = 'LiheYoung/depth_anything_vits14',
         save_path: str = None,
         raw: bool = False,
         stream: bool = False,
@@ -39,22 +30,9 @@ class DepthEngine:
         save: bool = False,
         grayscale: bool = False,
     ):
-        """
-        sensor_id: int | Sequence[int] -> Camera sensor id
-        input_size: int -> Width and height of the input tensor(e.g. 308, 364, 406, 518)
-        frame_rate: int -> Frame rate of the camera(depending on inference time)
-        trt_engine_path: str -> Path to the TensorRT engine
-        save_path: str -> Path to save the results
-        raw: bool -> Use only the raw depth map
-        stream: bool -> Stream the results
-        record: bool -> Record the results
-        save: bool -> Save the results
-        grayscale: bool -> Convert the depth map to grayscale
-        """
-        # Initialize the camera
         self.camera = Camera(sensor_id=sensor_id, frame_rate=frame_rate)
-        self.width = input_size # width of the input tensor
-        self.height = input_size # height of the input tensor
+        self.width = input_size
+        self.height = input_size
         self._width = int(self.camera.cap[0].get(cv2.CAP_PROP_FRAME_WIDTH))
         self._height = int(self.camera.cap[0].get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.save_path = Path(save_path) if isinstance(save_path, str) else Path("results")
@@ -63,41 +41,15 @@ class DepthEngine:
         self.record = record
         self.save = save
         self.grayscale = grayscale
-        
-        # Initialize the raw data
-        # Depth map without any postprocessing -> float32
-        # For visualization, change raw to False
-        if raw: self.raw_depth = None 
-        
-        # Load the TensorRT engine
-        self.runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING)) 
-        self.engine = self.runtime.deserialize_cuda_engine(open(trt_engine_path, 'rb').read())
-        self.context = self.engine.create_execution_context()
-        print(f"Engine loaded from {trt_engine_path}")
-        
-        # Allocate buffers based on actual tensor shapes from the engine
-        self.cuda_stream = cuda.Stream()
-        print(f"Number of IO tensors: {self.engine.num_io_tensors}")
-        for i in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(i)
-            shape = tuple(self.engine.get_tensor_shape(name))
-            dtype = self.engine.get_tensor_dtype(name)
-            mode = self.engine.get_tensor_mode(name)
-            volume = trt.volume(shape)
-            print(f"  Tensor[{i}]: name={name!r}, shape={shape}, dtype={dtype}, mode={mode}, volume={volume}")
-            h_buf = cuda.pagelocked_empty(volume, dtype=np.float32)
-            d_buf = cuda.mem_alloc(h_buf.nbytes)
-            if mode == trt.TensorIOMode.INPUT:
-                self.h_input, self.d_input = h_buf, d_buf
-            else:
-                self.h_output, self.d_output = h_buf, d_buf
-                self.output_shape = shape
-            self.context.set_tensor_address(name, int(d_buf))
-        print(f"Camera frame size: {self._width}x{self._height}")
-        print(f"Model input size: {self.width}x{self.height}")
-        print(f"Output tensor shape: {self.output_shape}")
-        
-        # Transform functions
+
+        if raw:
+            self.raw_depth = None
+
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Loading model from {weights_path!r} on {self.device}")
+        self.model = DepthAnything.from_pretrained(weights_path).to(self.device).eval()
+        print(f"Model loaded. Camera: {self._width}x{self._height}, input size: {input_size}x{input_size}")
+
         self.transform = Compose([
             transform.Resize(
                 width=input_size,
@@ -111,102 +63,76 @@ class DepthEngine:
             transform.NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             transform.PrepareForNet(),
         ])
-        
+
         if record:
-            # Recorded video's frame rate could be unmatched with the camera's frame rate due to inference time
             self.video = cv2.VideoWriter(
                 'results.mp4',
                 cv2.VideoWriter_fourcc(*'mp4v'),
                 frame_rate,
                 (2 * self._width, self._height),
             )
-        
-        # Make results directory
+
         if save:
-            os.makedirs(self.save_path, exist_ok=True) # if parent dir does not exist, create it
+            os.makedirs(self.save_path, exist_ok=True)
             self.save_path = self.save_path / f'{len(os.listdir(self.save_path)) + 1:06d}'
             os.makedirs(self.save_path, exist_ok=True)
-    
-    def preprocess(self, image: np.ndarray) -> np.ndarray:
-        """
-        Preprocess the image
-        """
-        image = image.astype(np.float32)
-        image /= 255.0
+
+    def preprocess(self, image: np.ndarray) -> torch.Tensor:
+        image = image.astype(np.float32) / 255.0
         image = self.transform({'image': image})['image']
-        image = image[None]
-        return image
+        return torch.from_numpy(image).unsqueeze(0).to(self.device)
 
     def postprocess(self, depth: np.ndarray) -> np.ndarray:
-        """
-        Postprocess the depth map
-        """
-        raw = depth.copy()
-        print(f"  Raw output: min={raw.min():.4f}, max={raw.max():.4f}, mean={raw.mean():.4f}, nonzero={np.count_nonzero(raw)}/{raw.size}")
-        depth = depth.reshape(self.output_shape).squeeze()
-        print(f"  Reshaped depth: {depth.shape}")
+        print(f"  Output: shape={depth.shape}, min={depth.min():.4f}, max={depth.max():.4f}, mean={depth.mean():.4f}")
         depth = cv2.resize(depth, (self._width, self._height))
 
         if self.raw:
             return depth
-        else:
-            dmin, dmax = depth.min(), depth.max()
-            print(f"  Depth after resize: min={dmin:.4f}, max={dmax:.4f}")
-            if dmax - dmin < 1e-6:
-                print("  WARNING: depth map is nearly constant — output may be degenerate")
-            depth = (dmax - depth) / (dmax - dmin + 1e-6) * 255.0
-            depth = depth.astype(np.uint8)
 
-            if self.grayscale:
-                depth = cv2.cvtColor(depth, cv2.COLOR_GRAY2BGR)
-            else:
-                depth = cv2.applyColorMap(depth, cv2.COLORMAP_INFERNO)
+        dmin, dmax = depth.min(), depth.max()
+        if dmax - dmin < 1e-6:
+            print("  WARNING: depth map is nearly constant")
+        depth = (dmax - depth) / (dmax - dmin + 1e-6) * 255.0
+        depth = depth.astype(np.uint8)
+
+        if self.grayscale:
+            depth = cv2.cvtColor(depth, cv2.COLOR_GRAY2BGR)
+        else:
+            depth = cv2.applyColorMap(depth, cv2.COLORMAP_INFERNO)
 
         return depth
 
     def infer(self, image: np.ndarray) -> np.ndarray:
-        """
-        Infer depth from an image using TensorRT
-        """
-        image = self.preprocess(image)
-        print(f"  Preprocessed input: shape={image.shape}, min={image.min():.4f}, max={image.max():.4f}")
+        tensor = self.preprocess(image)
+        print(f"  Input: shape={tuple(tensor.shape)}, min={tensor.min():.4f}, max={tensor.max():.4f}")
 
         t0 = time.time()
-
-        np.copyto(self.h_input, image.ravel())
-        cuda.memcpy_htod_async(self.d_input, self.h_input, self.cuda_stream)
-        self.context.execute_async_v3(stream_handle=self.cuda_stream.handle)
-        cuda.memcpy_dtoh_async(self.h_output, self.d_output, self.cuda_stream)
-        self.cuda_stream.synchronize()
-
+        with torch.no_grad():
+            depth = self.model(tensor)
         print(f"Inference time: {time.time() - t0:.4f}s")
 
-        return self.postprocess(self.h_output)
-    
+        depth = depth.squeeze().cpu().numpy()
+        return self.postprocess(depth)
+
     def run(self):
-        """
-        Real-time depth estimation
-        """
         try:
             while True:
-                # frame = self.camera.frame # This causes bad performance
                 _, frame = self.camera.cap[0].read()
                 depth = self.infer(frame)
-                
+
                 if self.raw:
                     self.raw_depth = depth
                 else:
                     results = np.concatenate((frame, depth), axis=1)
-                    
+
                     if self.record:
                         self.video.write(results)
-                        
+
                     if self.save:
                         cv2.imwrite(str(self.save_path / f'{datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")}.png'), results)
 
                     if self.stream:
-                        cv2.imshow('Depth', results) # This causes bad performance
-                        
+                        cv2.imshow('Depth', results)
                         if cv2.waitKey(1) == ord('q'):
                             break
         except Exception as e:
@@ -214,26 +140,30 @@ class DepthEngine:
         finally:
             if self.record:
                 self.video.release()
-                
             if self.stream:
                 cv2.destroyAllWindows()
-            
+
+
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
-    args.add_argument('--frame_rate', type=int, default=15, help='Frame rate of the camera')
-    args.add_argument('--raw', action='store_true', help='Use only the raw depth map')
-    args.add_argument('--stream', action='store_true', help='Stream the results')
-    args.add_argument('--record', action='store_true', help='Record the results')
-    args.add_argument('--save', action='store_true', help='Save the results')
-    args.add_argument('--grayscale', action='store_true', help='Convert the depth map to grayscale')
+    args.add_argument('--frame_rate', type=int, default=15)
+    args.add_argument('--input_size', type=int, default=308)
+    args.add_argument('--weights', type=str, default='LiheYoung/depth_anything_vits14')
+    args.add_argument('--raw', action='store_true')
+    args.add_argument('--stream', action='store_true')
+    args.add_argument('--record', action='store_true')
+    args.add_argument('--save', action='store_true')
+    args.add_argument('--grayscale', action='store_true')
     args = args.parse_args()
-    
+
     depth = DepthEngine(
         frame_rate=args.frame_rate,
+        input_size=args.input_size,
+        weights_path=args.weights,
         raw=args.raw,
-        stream=args.stream, 
+        stream=args.stream,
         record=args.record,
-        save=args.save, 
-        grayscale=args.grayscale
+        save=args.save,
+        grayscale=args.grayscale,
     )
     depth.run()
