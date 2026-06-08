@@ -32,13 +32,13 @@ class DepthAnythingNode(Node):
         super().__init__('depth_anything_node')
 
         # --- Parameters ---
-        self.declare_parameter('camera_topic', '/camera/image_raw')
-        self.declare_parameter('depth_topic', '/depth/image_raw')
+        self.declare_parameter('camera_topic', '/go2/camera/image_raw')
+        self.declare_parameter('depth_topic', '/go2/depth/image_raw')
         self.declare_parameter('depth_viz_topic', '/depth/image_viz')
         self.declare_parameter('trt_engine_path', 'weights/depth_anything_vits14_308.trt')
         self.declare_parameter('input_size', 308)  # must be divisible by 14
         self.declare_parameter('publish_viz', True)
-        self.declare_parameter('best_effort', False)
+        self.declare_parameter('best_effort', True)
 
         camera_topic    = self.get_parameter('camera_topic').value
         depth_topic     = self.get_parameter('depth_topic').value
